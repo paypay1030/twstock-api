@@ -8,4 +8,4 @@ pydantic-settings==2.2.1
 python-dotenv==1.0.1
 httpx==0.27.0
 cachetools==5.3.3
-twstock==1.5.2
+twstock
