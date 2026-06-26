@@ -124,8 +124,12 @@ def calculate_risk(
 
     # ── 因子三：ATR 波動率（25%）─────────────────────────────
     try:
-        atr = df["ATR14"].dropna().iloc[-1]
-        atr_pct = atr / current_price
+        from app.utils.safe_convert import safe_float as _sf
+        raw_atr = df["ATR14"].dropna()
+        atr_val = _sf(raw_atr.iloc[-1] if not raw_atr.empty else None, default=None)
+        if atr_val is None or atr_val <= 0:
+            raise ValueError("ATR unavailable")
+        atr_pct = atr_val / current_price
         if atr_pct < settings.atr_low_threshold:
             atr_score = 20.0
         elif atr_pct < settings.atr_high_threshold:

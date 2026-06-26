@@ -20,6 +20,7 @@ from app.services.volume_profile import (
 )
 from app.models.analysis import SRLevel, SupportResistanceResult
 from app.utils.price_utils import round_to_tick, pct_diff
+from app.utils.safe_convert import clean_df, safe_float, safe_score, safe_price
 
 settings = get_settings()
 
@@ -57,13 +58,22 @@ def _count_touches(price: float, df: pd.DataFrame, tolerance: float = 0.015) -> 
     計算價格被碰觸並反彈的次數
     tolerance = 1.5%（在此範圍內視為觸及）
     """
+    from app.utils.safe_convert import safe_float as _sf
+    if price <= 0:
+        return 0
     count = 0
     close = df["Close"].values
     for i in range(1, len(close) - 1):
-        if abs(close[i] - price) / price <= tolerance:
-            # 確認碰觸後有反彈（前後方向不同）
-            came_from_above = close[i-1] > price
-            went_back_above = close[i+1] > price
+        c = _sf(close[i], default=None)
+        if c is None or c <= 0:
+            continue
+        if abs(c - price) / price <= tolerance:
+            prev = _sf(close[i-1], default=None)
+            nxt  = _sf(close[i+1], default=None)
+            if prev is None or nxt is None:
+                continue
+            came_from_above = prev > price
+            went_back_above = nxt > price
             if came_from_above == went_back_above:
                 count += 1
     return count
@@ -154,6 +164,17 @@ def calculate_sr(df: pd.DataFrame, current_price: float) -> SupportResistanceRes
     """
     主計算函數：整合所有來源，輸出標準化 SupportResistanceResult
     """
+    # ── 防呆：清理 inf/NaN，ETF 短期上市資料特別容易有問題 ──
+    df = clean_df(df)
+    df = df[df["Close"] > 0].copy()   # 過濾收盤價異常行
+
+    if current_price <= 0 or df.empty:
+        return SupportResistanceResult(
+            support_levels=[],
+            resistance_levels=[],
+            stop_loss=round(current_price * 0.93, 2)
+        )
+
     # 1. Volume Profile
     vp_zones = calculate_volume_profile(df)
     vp_support, vp_resist = find_vp_support_resistance(current_price, vp_zones)
@@ -206,7 +227,8 @@ def calculate_sr(df: pd.DataFrame, current_price: float) -> SupportResistanceRes
 def _safe_ma(df: pd.DataFrame, col: str) -> float | None:
     try:
         val = df[col].dropna().iloc[-1]
-        return float(val) if not np.isnan(val) else None
+        result = safe_float(val, default=None)
+        return result
     except Exception:
         return None
 
@@ -284,7 +306,9 @@ def _score_and_rank(
         if total_score < settings.sr_score_normal:
             continue  # 弱位，不顯示
 
-        strength = "strong" if total_score >= settings.sr_score_strong else "normal"
+        # safe_score 確保 [0,100] 且非 NaN，避免 Pydantic ge/le 驗證失敗
+        safe_total = safe_score(total_score)
+        strength = "strong" if safe_total >= settings.sr_score_strong else "normal"
         prefix = "第一" if rank == 1 else "第二"
 
         if direction == "support":
@@ -292,14 +316,17 @@ def _score_and_rank(
         else:
             label = f"{prefix}壓力" + ("（強）" if strength == "strong" else "")
 
+        # range_low/high 用 safe_price 確保非 NaN 非負
         margin = price * 0.01
+        rl = safe_price(price - margin, price * 0.99)
+        rh = safe_price(price + margin, price * 1.01)
         results.append(SRLevel(
             rank=rank,
-            range_low=round(price - margin, 2),
-            range_high=round(price + margin, 2),
+            range_low=round(rl, 2),
+            range_high=round(rh, 2),
             label=label,
             strength=strength,
-            score=round(total_score, 1),
+            score=round(safe_total, 1),
             sources=sources
         ))
 

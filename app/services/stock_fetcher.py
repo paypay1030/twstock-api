@@ -11,6 +11,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from app.core.config import get_settings
 from app.core.cache import price_cache, history_cache
+from app.utils.safe_convert import safe_float, safe_int
 from app.utils.stock_list import get_stock_name
 
 settings = get_settings()
@@ -72,8 +73,12 @@ def get_stock_basic(code: str) -> dict:
 
         today  = hist.iloc[-1]
         prev   = hist.iloc[-2] if len(hist) >= 2 else hist.iloc[-1]
-        price  = float(today["Close"])
-        prev_c = float(prev["Close"])
+        price  = safe_float(today["Close"])
+        prev_c = safe_float(prev["Close"])
+
+        if price <= 0:
+            raise DataSourceError(f"{code} 現價異常（{price}）")
+
         change = round(price - prev_c, 2)
 
         name = get_stock_name(code) or _get_yf_name(ticker, code)
@@ -86,9 +91,9 @@ def get_stock_basic(code: str) -> dict:
             "current_price": price,
             "change":        change,
             "change_pct":    round(change / prev_c * 100, 2) if prev_c else 0,
-            "volume":        int(today["Volume"] // 1000),
-            "week52_high":   round(float(info.year_high), 2),
-            "week52_low":    round(float(info.year_low),  2),
+            "volume":        safe_int(today["Volume"], 0) // 1000,
+            "week52_high":   round(safe_float(getattr(info, "year_high", None), price), 2),
+            "week52_low":    round(safe_float(getattr(info, "year_low",  None), price), 2),
         }
         price_cache[cache_key] = result
         return result
@@ -150,19 +155,50 @@ def _get_yf_name(ticker, code: str) -> str:
 
 
 def _process_df(df: pd.DataFrame) -> pd.DataFrame:
+    from app.utils.safe_convert import safe_series_to_int, clean_df
+
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.index = pd.to_datetime(df.index).date
     df.index.name = "Date"
-    df["MA20"]  = df["Close"].rolling(20).mean().round(2)
-    df["MA60"]  = df["Close"].rolling(60).mean().round(2)
-    df["MA120"] = df["Close"].rolling(120).mean().round(2)
-    df["MA240"] = df["Close"].rolling(240).mean().round(2)
-    df["TR"]    = np.maximum(
+
+    # ── 防呆 Step 1：清理所有 inf / -inf，ETF 短期資料特別容易出現 ──
+    df = clean_df(df)
+
+    # ── 防呆 Step 2：過濾收盤價異常行（0 或 NaN 都可能導致後續計算 inf）──
+    df = df[df["Close"] > 0].copy()
+    df = df[df["Close"].notna()].copy()
+
+    if df.empty:
+        return df
+
+    # ── 防呆 Step 3：前向填充其餘 OHLV 欄位的 NaN，避免 TR 計算出現 NaN ──
+    df["Open"]   = df["Open"].fillna(df["Close"])
+    df["High"]   = df["High"].fillna(df["Close"])
+    df["Low"]    = df["Low"].fillna(df["Close"])
+    df["Volume"] = df["Volume"].fillna(0)
+
+    df["MA20"]  = df["Close"].rolling(20, min_periods=1).mean().round(2)
+    df["MA60"]  = df["Close"].rolling(60, min_periods=1).mean().round(2)
+    df["MA120"] = df["Close"].rolling(120, min_periods=1).mean().round(2)
+    df["MA240"] = df["Close"].rolling(240, min_periods=1).mean().round(2)
+
+    # TR：prev_close 取不到時 shift(1) 是 NaN，用 Close 本身代替
+    prev_close = df["Close"].shift(1).fillna(df["Close"])
+    df["TR"] = np.maximum(
         df["High"] - df["Low"],
-        np.maximum(abs(df["High"] - df["Close"].shift(1)),
-                   abs(df["Low"]  - df["Close"].shift(1))))
-    df["ATR14"] = df["TR"].rolling(14).mean().round(2)
-    df["Volume"] = (df["Volume"] // 1000).astype(int)
+        np.maximum(
+            (df["High"] - prev_close).abs(),
+            (df["Low"]  - prev_close).abs()
+        )
+    )
+    df["ATR14"] = df["TR"].rolling(14, min_periods=1).mean().round(2)
+
+    # ── 防呆 Step 4：再次清理（rolling 仍可能留下極端值）──
+    df = clean_df(df)
+
+    # ── Volume：安全轉 int，避免 NaN 或 inf 導致 astype(int) 爆炸 ──
+    df["Volume"] = safe_series_to_int(df["Volume"] // 1000)
+
     return df
 
 

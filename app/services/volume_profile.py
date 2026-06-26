@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from app.core.config import get_settings
+from app.utils.safe_convert import safe_series_to_int, clean_df
 
 settings = get_settings()
 
@@ -38,6 +39,14 @@ def calculate_volume_profile(
     """
     n = buckets or settings.volume_profile_buckets
 
+    # ── 防呆：清理 inf / NaN，避免 ETF 資料異常值導致轉型錯誤 ──
+    df = clean_df(df)
+
+    # 過濾掉 Close / Volume 異常的行
+    df = df[df["Close"] > 0].copy()
+    if df.empty:
+        return []
+
     price_min = df["Close"].min()
     price_max = df["Close"].max()
     bucket_size = (price_max - price_min) / n
@@ -46,9 +55,10 @@ def calculate_volume_profile(
         return []
 
     # 每根 K 棒依收盤價歸入對應格子
+    # 使用 safe_series_to_int 避免 NaN → astype(int) 拋 ValueError
+    raw_bucket = (df["Close"] - price_min) / bucket_size
     df = df.copy()
-    df["bucket"] = ((df["Close"] - price_min) / bucket_size).astype(int)
-    df["bucket"] = df["bucket"].clip(0, n - 1)
+    df["bucket"] = safe_series_to_int(raw_bucket).clip(0, n - 1)
 
     # 累積每格成交量
     grouped = df.groupby("bucket")["Volume"].sum()
