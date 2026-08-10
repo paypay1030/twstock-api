@@ -12,6 +12,7 @@ from app.services.stock_fetcher import get_stock_basic, get_stock_history, DataS
 from app.services.support_resistance import calculate_sr
 from app.services.risk_engine import calculate_signal, calculate_risk
 from app.services.decision_card import generate_decision_card
+from app.services.indicators import calculate_indicators
 
 router = APIRouter(prefix="/api/analysis", tags=["分析"])
 logger = logging.getLogger(__name__)
@@ -127,3 +128,135 @@ def _buy_zone(sr, price):
 def _sell_zone(sr, price):
     return [sr.resistance_levels[0].range_low, sr.resistance_levels[0].range_high] \
         if sr.resistance_levels else [round(price * 1.05, 2), round(price * 1.08, 2)]
+
+
+# ════════════════════════════════════════════════════════════
+# GET /api/analysis/{code}/indicators
+# 技術指標快照（MA / RSI / MACD / KD / Bollinger Bands）
+# ════════════════════════════════════════════════════════════
+
+@router.get("/{code}/indicators")
+async def get_indicators(code: str):
+    """
+    取得股票技術指標快照。
+
+    回傳最新一根 K 線對應的技術指標數值，
+    計算基礎為近 756 個交易日（約 3 年）歷史 K 線資料。
+
+    回傳格式與前端 TechIndicators 介面完全對齊。
+    """
+    try:
+        logger.info(f"[indicators] START code={code}")
+
+        df = get_stock_history(code)
+        logger.info(f"[indicators] history OK: rows={len(df)}")
+
+        result = calculate_indicators(df)
+        result = _sanitize(result)
+
+        logger.info(f"[indicators] DONE code={code} trend={result.get('trend')}")
+        return result
+
+    except DataSourceError as e:
+        logger.error(f"[indicators] DataSourceError code={code}: {e}")
+        raise HTTPException(503, detail=str(e))
+    except Exception as e:
+        logger.error(
+            f"[indicators] ERROR code={code}: {type(e).__name__}: {e}\n"
+            + traceback.format_exc()
+        )
+        raise HTTPException(500, detail=f"指標計算失敗：{type(e).__name__}: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+# GET /api/analysis/{code}/institutional
+# ════════════════════════════════════════════════════════════
+from app.services.institutional import calculate_institutional
+
+@router.get("/{code}/institutional")
+async def get_institutional(code: str):
+    """
+    三大法人近五個交易日買賣超資料（外資、投信、自營商）+ AI 白話解讀。
+
+    目前狀態：dataSource='unavailable'
+      Railway 網路環境尚未開放 TWSE/TPEX，暫無每日買賣超資料。
+      不使用 yfinance 機構持股資料替代（兩者資料定義不同）。
+
+    待開放後：只需更新 services/institutional.py 的 _fetch_twse/_fetch_tpex，
+      此 endpoint 與前端 UI 均不需修改。
+    """
+    try:
+        logger.info(f"[institutional] START code={code}")
+        result = calculate_institutional(code)
+        logger.info(f"[institutional] DONE code={code}")
+        return result
+    except DataSourceError as e:
+        logger.error(f"[institutional] DataSourceError code={code}: {e}")
+        raise HTTPException(503, detail=str(e))
+    except Exception as e:
+        logger.error(
+            f"[institutional] ERROR code={code}: {type(e).__name__}: {e}\n"
+            + __import__("traceback").format_exc()
+        )
+        raise HTTPException(500, detail=f"法人資料取得失敗：{type(e).__name__}: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+# DEBUG ONLY — Railway TWSE 連線實測
+# 僅供確認 Railway 網路環境是否可直接連 TWSE，不用於正式功能
+# 部署確認後可移除
+# ════════════════════════════════════════════════════════════
+import httpx as _httpx
+
+@router.get("/debug/twse-connection")
+async def debug_twse_connection():
+    """
+    診斷 Railway 生產環境是否可直接連線 TWSE T86。
+    只回傳連線結果，不回傳完整 TWSE response body。
+    """
+    url = "https://www.twse.com.tw/fund/T86?response=json&date=20260807&selectType=ALL"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; twstock-debug/1.0)",
+        "Accept": "application/json, */*",
+    }
+
+    try:
+        async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+
+        content_type = resp.headers.get("content-type", "unknown")
+        body_len = len(resp.content)
+
+        # 嘗試解析 JSON 確認資料結構（不回傳完整 body）
+        try:
+            j = resp.json()
+            data_stat  = j.get("stat", "N/A")
+            data_date  = j.get("date", "N/A")
+            row_count  = len(j.get("data", []))
+        except Exception:
+            data_stat = "parse_error"
+            data_date = "N/A"
+            row_count = 0
+
+        return {
+            "ok":              resp.status_code == 200,
+            "status":          resp.status_code,
+            "content_type":    content_type,
+            "response_length": body_len,
+            "twse_stat":       data_stat,   # "OK" or error string from TWSE
+            "twse_date":       data_date,   # date field returned by TWSE
+            "row_count":       row_count,   # number of stocks in response
+            "note":            "debug endpoint — do not use in production logic",
+        }
+
+    except _httpx.TimeoutException as e:
+        return {"ok": False, "error_type": "TimeoutException",    "error": str(e)}
+    except _httpx.ConnectError as e:
+        return {"ok": False, "error_type": "ConnectError",        "error": str(e)}
+    except _httpx.TooManyRedirects as e:
+        return {"ok": False, "error_type": "TooManyRedirects",    "error": str(e)}
+    except _httpx.HTTPStatusError as e:
+        return {"ok": False, "error_type": "HTTPStatusError",
+                "status": e.response.status_code, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error_type": type(e).__name__,      "error": str(e)}
