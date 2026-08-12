@@ -1,0 +1,18 @@
+# render.yaml — Render Free Tier 部署設定
+# 僅新增此檔案，不修改任何現有 Python 程式碼
+# Railway 設定（Procfile / railway.toml）保持不動
+
+services:
+  - type: web
+    name: twstock-api
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: ALLOWED_ORIGINS
+        value: '["https://twstock-frontend-nu.vercel.app"]'
