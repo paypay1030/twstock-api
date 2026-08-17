@@ -260,3 +260,120 @@ async def debug_twse_connection():
                 "status": e.response.status_code, "error": str(e)}
     except Exception as e:
         return {"ok": False, "error_type": type(e).__name__,      "error": str(e)}
+
+
+@router.get("/debug/tpex-connection")
+async def debug_tpex_connection():
+    """
+    診斷 Render 生產環境是否可連 TPEX，並確認實際欄位格式。
+    只回傳前 2 筆資料供欄位確認，不回傳完整 body。
+    """
+    import httpx as _httpx
+    from datetime import datetime, timedelta
+
+    # 找最近一個工作日
+    d = datetime.now()
+    for _ in range(7):
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            break
+    date_str = f"{d.year}/{d.month:02d}/{d.day:02d}"  # TPEX 格式 YYYY/MM/DD
+
+    url = (
+        f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
+        f"3itrade_hedge_result.php?l=zh-tw&se=AL&t=D&d={date_str}"
+    )
+
+    try:
+        async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; twstock-debug/1.0)",
+                "Accept": "application/json, */*",
+                "Referer": "https://www.tpex.org.tw/",
+            })
+
+        content_type = resp.headers.get("content-type", "unknown")
+
+        try:
+            j = resp.json()
+            # TPEX 回傳格式通常是 {"reportDate": ..., "iTotalRecords": ..., "aaData": [...]}
+            aa_data = j.get("aaData", j.get("data", []))
+            sample  = aa_data[:2] if aa_data else []
+            keys    = list(j.keys())
+        except Exception:
+            j       = None
+            sample  = []
+            keys    = []
+
+        return {
+            "ok":            resp.status_code == 200,
+            "status":        resp.status_code,
+            "content_type":  content_type,
+            "date_queried":  date_str,
+            "response_length": len(resp.content),
+            "top_level_keys":  keys,
+            "sample_rows":     sample,          # 前 2 筆，確認欄位
+            "note": "debug only — TPEX format probe",
+        }
+
+    except _httpx.TimeoutException as e:
+        return {"ok": False, "error_type": "TimeoutException", "error": str(e)}
+    except _httpx.ConnectError as e:
+        return {"ok": False, "error_type": "ConnectError", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error_type": type(e).__name__, "error": str(e)}
+
+
+@router.get("/debug/twse-fields")
+async def debug_twse_fields():
+    """
+    確認 TWSE T86 與 TPEX OpenAPI 的實際欄位名稱與單位。
+    僅供 Phase 14 開發確認，確認後移除。
+    """
+    import httpx as _hx
+    results = {}
+
+    # ── TWSE T86 fields 確認 ──
+    try:
+        async with _hx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(
+                "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date=20260807&selectType=ALL",
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
+            )
+        j = r.json()
+        fields = j.get("fields", [])
+        # 找 2330 的資料行
+        row_2330 = next((row for row in j.get("data", []) if row and row[0] == "2330"), None)
+        results["twse"] = {
+            "stat": j.get("stat"),
+            "date": j.get("date"),
+            "fields": fields,
+            "fields_count": len(fields),
+            "sample_2330_raw": row_2330,  # 原始字串，確認格式
+        }
+    except Exception as e:
+        results["twse"] = {"error": str(e)}
+
+    # ── TPEX OpenAPI fields 確認 ──
+    try:
+        async with _hx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(
+                "https://www.tpex.org.tw/openapi/v1/tpex_institutional_investors_trading_summary",
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+            )
+        data = r.json()
+        # 取前 3 筆確認格式
+        sample = data[:3] if isinstance(data, list) else data
+        # 找 6770 力積電
+        row_6770 = next((row for row in (data if isinstance(data, list) else []) if row.get("Code") == "6770"), None)
+        results["tpex"] = {
+            "status": r.status_code,
+            "total_count": len(data) if isinstance(data, list) else "N/A",
+            "sample_keys": list(sample[0].keys()) if isinstance(sample, list) and sample else [],
+            "sample_3rows": sample,
+            "sample_6770": row_6770,
+        }
+    except Exception as e:
+        results["tpex"] = {"error": str(e)}
+
+    return results
