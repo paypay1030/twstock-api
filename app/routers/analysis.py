@@ -176,23 +176,15 @@ from app.services.institutional import calculate_institutional
 @router.get("/{code}/institutional")
 async def get_institutional(code: str):
     """
-    三大法人近五個交易日買賣超資料（外資、投信、自營商）+ AI 白話解讀。
-
-    目前狀態：dataSource='unavailable'
-      Railway 網路環境尚未開放 TWSE/TPEX，暫無每日買賣超資料。
-      不使用 yfinance 機構持股資料替代（兩者資料定義不同）。
-
-    待開放後：只需更新 services/institutional.py 的 _fetch_twse/_fetch_tpex，
-      此 endpoint 與前端 UI 均不需修改。
+    三大法人近五個交易日買賣超資料（外資、投信、自營商）。
+    上市 → TWSE T86；上櫃 → TPEX 3itrade。
+    Render 生產環境已確認可連線 TWSE/TPEX（2026-08-13 實測）。
     """
     try:
         logger.info(f"[institutional] START code={code}")
-        result = calculate_institutional(code)
+        result = await calculate_institutional(code)
         logger.info(f"[institutional] DONE code={code}")
         return result
-    except DataSourceError as e:
-        logger.error(f"[institutional] DataSourceError code={code}: {e}")
-        raise HTTPException(503, detail=str(e))
     except Exception as e:
         logger.error(
             f"[institutional] ERROR code={code}: {type(e).__name__}: {e}\n"
