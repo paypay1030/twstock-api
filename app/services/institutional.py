@@ -255,7 +255,35 @@ async def _fetch_tpex_day(client: httpx.AsyncClient, code: str, date_str: str) -
     """
     取得 TPEX 單日指定股票的三大法人資料。
     date_str: YYYY/MM/DD
-    回傳 None 代表該日無資料。
+
+    欄位索引（由 Render 實測 2026-08-21 確認，共 24 欄）：
+      [0]  代號
+      [1]  名稱
+      [2]  外資及陸資買進股數     （千股=張）
+      [3]  外資及陸資賣出股數
+      [4]  外資及陸資買賣超股數   ← 外資主力（業界慣用）
+      [5]  外資自營商買進股數
+      [6]  外資自營商賣出股數
+      [7]  外資自營商買賣超股數
+      [8]  外資合計買進股數
+      [9]  外資合計賣出股數
+      [10] 外資合計買賣超股數     ← 外資+外資自營商合計
+      [11] 投信買進股數
+      [12] 投信賣出股數
+      [13] 投信買賣超股數         ← 投信
+      [14] 自營商(自行)買進股數
+      [15] 自營商(自行)賣出股數
+      [16] 自營商(自行)買賣超股數
+      [17] 自營商(避險)買進股數
+      [18] 自營商(避險)賣出股數
+      [19] 自營商(避險)買賣超股數
+      [20] 自營商合計買進股數
+      [21] 自營商合計賣出股數
+      [22] 自營商合計買賣超股數   ← 自營商（自行+避險合計）
+      [23] 三大法人買賣超股數合計
+
+    單位：千股（= 張），直接使用，不需再除以 1000。
+    驗算（1565 精華 2026-08-21）：外資1953 + 投信0 + 自營-116 = 1837 ✅
     """
     url = (
         "https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
@@ -268,94 +296,61 @@ async def _fetch_tpex_day(client: httpx.AsyncClient, code: str, date_str: str) -
         logger.warning(f"[tpex] {code} {date_str} fetch error: {e}")
         return None
 
-    # TPEX stat 可能是 "OK"、"" 或其他；tables 空代表無資料
-    stat   = j.get("stat", "")
     tables = j.get("tables", [])
     if not tables:
-        logger.debug(f"[tpex] {code} {date_str} stat={stat!r} tables=empty")
         return None
 
-    # 找第一個有欄位的 table
-    target_table = None
-    for t in tables:
-        if t.get("fields") and t.get("data"):
-            target_table = t
-            break
-    if target_table is None:
+    # 找第一個有 data 的 table
+    target_table = next((t for t in tables if t.get("data")), None)
+    if not target_table:
         return None
 
-    fields = target_table["fields"]
+    fields = target_table.get("fields", [])
     data   = target_table["data"]
+
+    # 確認欄位數量（24 欄），避免 TPEX 改版時默默算錯
+    if len(fields) != 24:
+        logger.warning(f"[tpex] {code} {date_str} unexpected fields count={len(fields)}")
+        # 欄位數不符時仍嘗試解析，但記錄警告供排查
+        if len(fields) < 24:
+            return None
 
     # 找目標股票（第一欄為代號）
     row = next((r for r in data if r and str(r[0]).strip() == code), None)
     if row is None:
         return None
 
-    # 動態匹配欄位：精確找「買賣超」欄位，避免誤匹配買進/賣出欄
-    def find_net_col(must_contain: list[str], must_not: list[str] = None) -> Optional[float]:
-        """
-        在 fields 中找第一個同時包含 must_contain 所有關鍵字、
-        且不含 must_not 任何關鍵字的欄位。
-        """
-        must_not = must_not or []
-        for i, f in enumerate(fields):
-            if (all(k in f for k in must_contain)
-                    and not any(k in f for k in must_not)
-                    and i < len(row)):
-                return _parse_num(row[i])
-        return None
-
-    # TPEX 欄位精確匹配：只取「買賣超」欄，排除「買進」「賣出」欄
-    # 單位：千股（= 張），直接使用，不需再除以 1000
-    # 外資欄位可能是「外資買賣超」或「外資及陸資買賣超」或「外陸資買賣超」
-    foreign_net_raw = (
-        find_net_col(["外資及陸資", "買賣超"], must_not=["買進", "賣出"])
-        or find_net_col(["外陸資",    "買賣超"], must_not=["買進", "賣出"])
-        or find_net_col(["外資",       "買賣超"], must_not=["買進", "賣出", "陸資"])
-    )
-    invest_net_raw = find_net_col(["投信", "買賣超"], must_not=["買進", "賣出"])
-
-    # 自營商合計買賣超（排除自行/避險明細欄）
-    dealer_net_raw = find_net_col(["自營商", "買賣超"], must_not=["自行", "避險", "買進", "賣出"])
-    # 若無合計欄，加總自行與避險明細（None-safe）
-    if dealer_net_raw is None:
-        self_net  = find_net_col(["自行",  "買賣超"], must_not=["買進", "賣出"])
-        hedge_net = find_net_col(["避險",  "買賣超"], must_not=["買進", "賣出"])
-        if self_net is not None or hedge_net is not None:
-            # 使用 None-safe 加法，避免 0 or 0 = 0 的 falsy 問題
-            dealer_net_raw = (
-                (self_net  if self_net  is not None else 0.0) +
-                (hedge_net if hedge_net is not None else 0.0)
-            )
+    def col(i: int) -> Optional[float]:
+        """取第 i 欄的數值（千股），回傳 None 表示無資料。"""
+        if i >= len(row):
+            return None
+        return _parse_num(row[i])
 
     def to_lots(v: Optional[float]) -> Optional[int]:
+        """千股直接取整為張。"""
         return round(v) if v is not None else None
 
-    foreign_net = to_lots(foreign_net_raw)
-    invest_net  = to_lots(invest_net_raw)
-    dealer_net  = to_lots(dealer_net_raw)
-    total_net   = None
-    if foreign_net is not None and invest_net is not None and dealer_net is not None:
-        total_net = foreign_net + invest_net + dealer_net
+    # 使用確認的索引（見上方 docstring）
+    foreign_net = to_lots(col(4))    # 外資及陸資買賣超（業界標準）
+    invest_net  = to_lots(col(13))   # 投信買賣超
+    dealer_net  = to_lots(col(22))   # 自營商合計買賣超
+    total_net   = to_lots(col(23))   # 三大法人合計
 
-    # 日期轉換 YYYY/MM/DD → YYYYMMDD
     date_key = date_str.replace("/", "")
 
     return {
         "date":         date_str,
         "date_key":     date_key,
-        "foreign_buy":  None,   # TPEX 合計欄不提供買/賣分開
-        "foreign_sell": None,
+        "foreign_buy":  to_lots(col(2)),
+        "foreign_sell": to_lots(col(3)),
         "foreign_net":  foreign_net,
-        "invest_buy":   None,
-        "invest_sell":  None,
+        "invest_buy":   to_lots(col(11)),
+        "invest_sell":  to_lots(col(12)),
         "invest_net":   invest_net,
-        "dealer_buy":   None,
-        "dealer_sell":  None,
+        "dealer_buy":   to_lots(col(20)),
+        "dealer_sell":  to_lots(col(21)),
         "dealer_net":   dealer_net,
         "total_net":    total_net,
-        "_fields_used": fields,   # 除錯用，確認欄位名稱
     }
 
 
