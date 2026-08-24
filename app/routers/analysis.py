@@ -287,18 +287,31 @@ async def debug_tpex_connection():
         fields = t0.get("fields", [])
         data   = t0.get("data",   [])
         # 找 1565
-        row_1565 = next((r for r in data if r and str(r[0]).strip() == "1565"), None)
-        # 回傳欄位對照表
+        # 確認 data 第一欄的原始格式
+        first_3_rows = data[:3]
+        first_col_samples = [r[0] if r else None for r in data[:5]]
+        # 搜尋 1565（含前後空白/特殊字元）
+        row_1565 = None
+        row_1565_idx = None
+        for i, r in enumerate(data):
+            if r and "1565" in str(r[0]):
+                row_1565 = r
+                row_1565_idx = i
+                break
         field_map = None
         if row_1565:
-            field_map = {f"[{i}] {fields[i]}": row_1565[i] for i in range(min(len(fields), len(row_1565)))}
+            field_map = {f"[{i}] {fields[i] if i<len(fields) else '?'}": row_1565[i]
+                        for i in range(min(len(fields), len(row_1565)))}
         return {
-            "date":       date_str,
-            "status":     resp.status_code,
-            "table_count": len(tables),
-            "fields":     fields,
-            "row_1565":   row_1565,
-            "field_map":  field_map,
+            "date":            date_str,
+            "status":          resp.status_code,
+            "table_count":     len(tables),
+            "fields":          fields,
+            "first_col_samples": first_col_samples,
+            "first_3_rows":    first_3_rows,
+            "row_1565":        row_1565,
+            "row_1565_idx":    row_1565_idx,
+            "field_map":       field_map,
         }
     except Exception as e:
         return {"error": type(e).__name__, "detail": str(e)}
@@ -357,3 +370,63 @@ async def debug_twse_fields():
         results["tpex"] = {"error": str(e)}
 
     return results
+
+
+@router.get("/debug/tpex-1565")
+async def debug_tpex_1565():
+    """
+    逐日追蹤 1565 的 TPEX 取得過程，找出 null 的原因。
+    """
+    import httpx as _hx
+    from datetime import datetime, timedelta
+
+    results = []
+    d = datetime.now()
+
+    async with _hx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        attempts = 0
+        while len(results) < 3 and attempts < 10:
+            d -= timedelta(days=1)
+            attempts += 1
+            if d.weekday() >= 5:
+                continue
+
+            date_str = f"{d.year}/{d.month:02d}/{d.day:02d}"
+            url = (
+                "https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
+                f"3itrade_hedge_result.php?l=zh-tw&se=AL&t=D&d={date_str}"
+            )
+            try:
+                resp = await client.get(url, headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; twstock-debug/1.0)",
+                    "Accept": "application/json, */*",
+                    "Referer": "https://www.tpex.org.tw/",
+                })
+                j = resp.json()
+                tables = j.get("tables", [])
+                t0 = tables[0] if tables else {}
+                fields = t0.get("fields", [])
+                data   = t0.get("data",   [])
+
+                row_1565 = next(
+                    (r for r in data if r and str(r[0]).strip() == "1565"),
+                    None
+                )
+
+                results.append({
+                    "date":         date_str,
+                    "status":       resp.status_code,
+                    "table_count":  len(tables),
+                    "fields_count": len(fields),
+                    "data_count":   len(data),
+                    "row_1565_found": row_1565 is not None,
+                    # 若找到，回傳關鍵索引的值（不回傳整行）
+                    "col4_foreign":  row_1565[4]  if row_1565 and len(row_1565) > 4  else "N/A",
+                    "col13_invest":  row_1565[13] if row_1565 and len(row_1565) > 13 else "N/A",
+                    "col22_dealer":  row_1565[22] if row_1565 and len(row_1565) > 22 else "N/A",
+                    "col23_total":   row_1565[23] if row_1565 and len(row_1565) > 23 else "N/A",
+                })
+            except Exception as e:
+                results.append({"date": date_str, "error": str(e)})
+
+    return {"results": results}
