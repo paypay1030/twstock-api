@@ -257,25 +257,21 @@ async def debug_twse_connection():
 @router.get("/debug/tpex-connection")
 async def debug_tpex_connection():
     """
-    診斷 Render 生產環境是否可連 TPEX，並確認實際欄位格式。
-    只回傳前 2 筆資料供欄位確認，不回傳完整 body。
+    回傳 TPEX 1565 的原始 tables[0].fields 與 row，
+    供確認欄位名稱與對應值。Debug only。
     """
     import httpx as _httpx
     from datetime import datetime, timedelta
-
-    # 找最近一個工作日
     d = datetime.now()
     for _ in range(7):
         d -= timedelta(days=1)
         if d.weekday() < 5:
             break
-    date_str = f"{d.year}/{d.month:02d}/{d.day:02d}"  # TPEX 格式 YYYY/MM/DD
-
+    date_str = f"{d.year}/{d.month:02d}/{d.day:02d}"
     url = (
-        f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
+        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
         f"3itrade_hedge_result.php?l=zh-tw&se=AL&t=D&d={date_str}"
     )
-
     try:
         async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(url, headers={
@@ -283,37 +279,29 @@ async def debug_tpex_connection():
                 "Accept": "application/json, */*",
                 "Referer": "https://www.tpex.org.tw/",
             })
-
-        content_type = resp.headers.get("content-type", "unknown")
-
-        try:
-            j = resp.json()
-            # TPEX 回傳格式通常是 {"reportDate": ..., "iTotalRecords": ..., "aaData": [...]}
-            aa_data = j.get("aaData", j.get("data", []))
-            sample  = aa_data[:2] if aa_data else []
-            keys    = list(j.keys())
-        except Exception:
-            j       = None
-            sample  = []
-            keys    = []
-
+        j = resp.json()
+        tables = j.get("tables", [])
+        if not tables:
+            return {"error": "no tables", "keys": list(j.keys()), "date": date_str}
+        t0 = tables[0]
+        fields = t0.get("fields", [])
+        data   = t0.get("data",   [])
+        # 找 1565
+        row_1565 = next((r for r in data if r and str(r[0]).strip() == "1565"), None)
+        # 回傳欄位對照表
+        field_map = None
+        if row_1565:
+            field_map = {f"[{i}] {fields[i]}": row_1565[i] for i in range(min(len(fields), len(row_1565)))}
         return {
-            "ok":            resp.status_code == 200,
-            "status":        resp.status_code,
-            "content_type":  content_type,
-            "date_queried":  date_str,
-            "response_length": len(resp.content),
-            "top_level_keys":  keys,
-            "sample_rows":     sample,          # 前 2 筆，確認欄位
-            "note": "debug only — TPEX format probe",
+            "date":       date_str,
+            "status":     resp.status_code,
+            "table_count": len(tables),
+            "fields":     fields,
+            "row_1565":   row_1565,
+            "field_map":  field_map,
         }
-
-    except _httpx.TimeoutException as e:
-        return {"ok": False, "error_type": "TimeoutException", "error": str(e)}
-    except _httpx.ConnectError as e:
-        return {"ok": False, "error_type": "ConnectError", "error": str(e)}
     except Exception as e:
-        return {"ok": False, "error_type": type(e).__name__, "error": str(e)}
+        return {"error": type(e).__name__, "detail": str(e)}
 
 
 @router.get("/debug/twse-fields")
