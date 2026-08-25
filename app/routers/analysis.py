@@ -171,17 +171,22 @@ async def get_indicators(code: str):
 # ════════════════════════════════════════════════════════════
 # GET /api/analysis/{code}/institutional
 # ════════════════════════════════════════════════════════════
-from app.services.institutional import calculate_institutional
+from app.services.institutional import calculate_institutional, _inst_cache
 
 @router.get("/{code}/institutional")
-async def get_institutional(code: str):
+async def get_institutional(code: str, force: bool = False):
     """
     三大法人近五個交易日買賣超資料（外資、投信、自營商）。
     上市 → TWSE T86；上櫃 → TPEX 3itrade。
-    Render 生產環境已確認可連線 TWSE/TPEX（2026-08-13 實測）。
+    force=true 可強制清除快取重新取得。
     """
+    if force:
+        cache_key = f"inst:{code}"
+        if cache_key in _inst_cache:
+            del _inst_cache[cache_key]
+            logger.info(f"[institutional] cache cleared: {code}")
     try:
-        logger.info(f"[institutional] START code={code}")
+        logger.info(f"[institutional] START code={code} force={force}")
         result = await calculate_institutional(code)
         logger.info(f"[institutional] DONE code={code}")
         return result
@@ -293,11 +298,17 @@ async def debug_tpex_connection():
         # 搜尋 1565（含前後空白/特殊字元）
         row_1565 = None
         row_1565_idx = None
+        col0_debug = []
         for i, r in enumerate(data):
-            if r and "1565" in str(r[0]):
-                row_1565 = r
-                row_1565_idx = i
-                break
+            if r:
+                raw = r[0]
+                # 收集前5筆第一欄的 repr，確認隱藏字元
+                if i < 5:
+                    col0_debug.append(repr(raw))
+                if "1565" in str(raw):
+                    row_1565 = r
+                    row_1565_idx = i
+                    break
         field_map = None
         if row_1565:
             field_map = {f"[{i}] {fields[i] if i<len(fields) else '?'}": row_1565[i]
@@ -308,6 +319,7 @@ async def debug_tpex_connection():
             "table_count":     len(tables),
             "fields":          fields,
             "first_col_samples": first_col_samples,
+            "col0_debug_repr": col0_debug,
             "first_3_rows":    first_3_rows,
             "row_1565":        row_1565,
             "row_1565_idx":    row_1565_idx,
