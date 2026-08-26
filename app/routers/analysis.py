@@ -13,6 +13,10 @@ from app.services.support_resistance import calculate_sr
 from app.services.risk_engine import calculate_signal, calculate_risk
 from app.services.decision_card import generate_decision_card
 from app.services.indicators import calculate_indicators
+from cachetools import TTLCache as _TTLCache
+
+# indicators 快取：TTL 1 小時，最多 200 支
+_ind_cache: _TTLCache = _TTLCache(maxsize=200, ttl=3600)
 
 router = APIRouter(prefix="/api/analysis", tags=["分析"])
 logger = logging.getLogger(__name__)
@@ -139,33 +143,38 @@ def _sell_zone(sr, price):
 async def get_indicators(code: str):
     """
     取得股票技術指標快照。
-
-    回傳最新一根 K 線對應的技術指標數值，
-    計算基礎為近 756 個交易日（約 3 年）歷史 K 線資料。
-
-    回傳格式與前端 TechIndicators 介面完全對齊。
+    TTL 1 小時快取，避免重複計算。
     """
-    try:
-        logger.info(f"[indicators] START code={code}")
+    # 快取命中
+    if code in _ind_cache:
+        logger.debug(f"[indicators] cache hit: {code}")
+        return _ind_cache[code]
 
-        df = get_stock_history(code)
-        logger.info(f"[indicators] history OK: rows={len(df)}")
+    last_err = None
+    for attempt in range(2):   # 最多 retry 1 次
+        try:
+            logger.info(f"[indicators] START code={code} attempt={attempt+1}")
+            df = get_stock_history(code)
+            result = calculate_indicators(df)
+            result = _sanitize(result)
+            _ind_cache[code] = result
+            logger.info(f"[indicators] DONE code={code} trend={result.get('trend')}")
+            return result
+        except DataSourceError as e:
+            last_err = e
+            logger.warning(f"[indicators] DataSourceError attempt={attempt+1}: {e}")
+            if attempt == 0:
+                await __import__('asyncio').sleep(1)
+        except Exception as e:
+            last_err = e
+            logger.error(f"[indicators] ERROR attempt={attempt+1}: {type(e).__name__}: {e}")
+            if attempt == 0:
+                await __import__('asyncio').sleep(1)
 
-        result = calculate_indicators(df)
-        result = _sanitize(result)
-
-        logger.info(f"[indicators] DONE code={code} trend={result.get('trend')}")
-        return result
-
-    except DataSourceError as e:
-        logger.error(f"[indicators] DataSourceError code={code}: {e}")
-        raise HTTPException(503, detail=str(e))
-    except Exception as e:
-        logger.error(
-            f"[indicators] ERROR code={code}: {type(e).__name__}: {e}\n"
-            + traceback.format_exc()
-        )
-        raise HTTPException(500, detail=f"指標計算失敗：{type(e).__name__}: {e}")
+    # retry 後仍失敗
+    if isinstance(last_err, DataSourceError):
+        raise HTTPException(503, detail=str(last_err))
+    raise HTTPException(500, detail=f"技術指標計算失敗，請稍後再試")
 
 
 # ════════════════════════════════════════════════════════════
@@ -199,246 +208,41 @@ async def get_institutional(code: str, force: bool = False):
 
 
 # ════════════════════════════════════════════════════════════
-# DEBUG ONLY — Railway TWSE 連線實測
-# 僅供確認 Railway 網路環境是否可直接連 TWSE，不用於正式功能
-# 部署確認後可移除
+# 連線健康檢查（用於監控 TWSE 連線狀況）
+# production 環境需傳入 key=<DEBUG_KEY> 才能呼叫
 # ════════════════════════════════════════════════════════════
-import httpx as _httpx
+import os as _os
 
 @router.get("/debug/twse-connection")
-async def debug_twse_connection():
+async def check_twse_connection(key: str = ""):
     """
-    診斷 Railway 生產環境是否可直接連線 TWSE T86。
-    只回傳連線結果，不回傳完整 TWSE response body。
+    確認後端可連線 TWSE T86。
+    production 環境需傳入 ?key=<DEBUG_KEY> 環境變數值。
     """
-    url = "https://www.twse.com.tw/fund/T86?response=json&date=20260807&selectType=ALL"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; twstock-debug/1.0)",
-        "Accept": "application/json, */*",
-    }
+    debug_key = _os.environ.get("DEBUG_KEY", "")
+    app_env   = _os.environ.get("APP_ENV", "development")
+    if app_env == "production" and (not debug_key or key != debug_key):
+        raise HTTPException(403, detail="需要提供正確的 debug key")
 
-    try:
-        async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-
-        content_type = resp.headers.get("content-type", "unknown")
-        body_len = len(resp.content)
-
-        # 嘗試解析 JSON 確認資料結構（不回傳完整 body）
-        try:
-            j = resp.json()
-            data_stat  = j.get("stat", "N/A")
-            data_date  = j.get("date", "N/A")
-            row_count  = len(j.get("data", []))
-        except Exception:
-            data_stat = "parse_error"
-            data_date = "N/A"
-            row_count = 0
-
-        return {
-            "ok":              resp.status_code == 200,
-            "status":          resp.status_code,
-            "content_type":    content_type,
-            "response_length": body_len,
-            "twse_stat":       data_stat,   # "OK" or error string from TWSE
-            "twse_date":       data_date,   # date field returned by TWSE
-            "row_count":       row_count,   # number of stocks in response
-            "note":            "debug endpoint — do not use in production logic",
-        }
-
-    except _httpx.TimeoutException as e:
-        return {"ok": False, "error_type": "TimeoutException",    "error": str(e)}
-    except _httpx.ConnectError as e:
-        return {"ok": False, "error_type": "ConnectError",        "error": str(e)}
-    except _httpx.TooManyRedirects as e:
-        return {"ok": False, "error_type": "TooManyRedirects",    "error": str(e)}
-    except _httpx.HTTPStatusError as e:
-        return {"ok": False, "error_type": "HTTPStatusError",
-                "status": e.response.status_code, "error": str(e)}
-    except Exception as e:
-        return {"ok": False, "error_type": type(e).__name__,      "error": str(e)}
-
-
-@router.get("/debug/tpex-connection")
-async def debug_tpex_connection():
-    """
-    回傳 TPEX 1565 的原始 tables[0].fields 與 row，
-    供確認欄位名稱與對應值。Debug only。
-    """
     import httpx as _httpx
-    from datetime import datetime, timedelta
-    d = datetime.now()
-    for _ in range(7):
-        d -= timedelta(days=1)
-        if d.weekday() < 5:
-            break
-    date_str = f"{d.year}/{d.month:02d}/{d.day:02d}"
-    url = (
-        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
-        f"3itrade_hedge_result.php?l=zh-tw&se=AL&t=D&d={date_str}"
-    )
+    url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
     try:
-        async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        async with _httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
             resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; twstock-debug/1.0)",
-                "Accept": "application/json, */*",
-                "Referer": "https://www.tpex.org.tw/",
+                "User-Agent": "Mozilla/5.0 (compatible; twstock-api/1.0)",
+                "Referer":    "https://www.twse.com.tw/",
             })
         j = resp.json()
-        tables = j.get("tables", [])
-        if not tables:
-            return {"error": "no tables", "keys": list(j.keys()), "date": date_str}
-        t0 = tables[0]
-        fields = t0.get("fields", [])
-        data   = t0.get("data",   [])
-        # 找 1565
-        # 確認 data 第一欄的原始格式
-        first_3_rows = data[:3]
-        first_col_samples = [r[0] if r else None for r in data[:5]]
-        # 搜尋 1565（含前後空白/特殊字元）
-        row_1565 = None
-        row_1565_idx = None
-        col0_debug = []
-        for i, r in enumerate(data):
-            if r:
-                raw = r[0]
-                # 收集前5筆第一欄的 repr，確認隱藏字元
-                if i < 5:
-                    col0_debug.append(repr(raw))
-                if "1565" in str(raw):
-                    row_1565 = r
-                    row_1565_idx = i
-                    break
-        field_map = None
-        if row_1565:
-            field_map = {f"[{i}] {fields[i] if i<len(fields) else '?'}": row_1565[i]
-                        for i in range(min(len(fields), len(row_1565)))}
         return {
-            "date":            date_str,
-            "status":          resp.status_code,
-            "table_count":     len(tables),
-            "fields":          fields,
-            "first_col_samples": first_col_samples,
-            "col0_debug_repr": col0_debug,
-            "first_3_rows":    first_3_rows,
-            "row_1565":        row_1565,
-            "row_1565_idx":    row_1565_idx,
-            "field_map":       field_map,
+            "ok":        resp.status_code == 200,
+            "status":    resp.status_code,
+            "twse_stat": j.get("stat"),
+            "twse_date": j.get("date"),
+            "row_count": len(j.get("data", [])),
         }
+    except _httpx.TimeoutException:
+        return {"ok": False, "error_type": "TimeoutException"}
+    except _httpx.ConnectError as e:
+        return {"ok": False, "error_type": "ConnectError", "error": str(e)[:120]}
     except Exception as e:
-        return {"error": type(e).__name__, "detail": str(e)}
-
-
-@router.get("/debug/twse-fields")
-async def debug_twse_fields():
-    """
-    確認 TWSE T86 與 TPEX OpenAPI 的實際欄位名稱與單位。
-    僅供 Phase 14 開發確認，確認後移除。
-    """
-    import httpx as _hx
-    results = {}
-
-    # ── TWSE T86 fields 確認 ──
-    try:
-        async with _hx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            r = await client.get(
-                "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date=20260807&selectType=ALL",
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
-            )
-        j = r.json()
-        fields = j.get("fields", [])
-        # 找 2330 的資料行
-        row_2330 = next((row for row in j.get("data", []) if row and row[0] == "2330"), None)
-        results["twse"] = {
-            "stat": j.get("stat"),
-            "date": j.get("date"),
-            "fields": fields,
-            "fields_count": len(fields),
-            "sample_2330_raw": row_2330,  # 原始字串，確認格式
-        }
-    except Exception as e:
-        results["twse"] = {"error": str(e)}
-
-    # ── TPEX OpenAPI fields 確認 ──
-    try:
-        async with _hx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            r = await client.get(
-                "https://www.tpex.org.tw/openapi/v1/tpex_institutional_investors_trading_summary",
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-            )
-        data = r.json()
-        # 取前 3 筆確認格式
-        sample = data[:3] if isinstance(data, list) else data
-        # 找 6770 力積電
-        row_6770 = next((row for row in (data if isinstance(data, list) else []) if row.get("Code") == "6770"), None)
-        results["tpex"] = {
-            "status": r.status_code,
-            "total_count": len(data) if isinstance(data, list) else "N/A",
-            "sample_keys": list(sample[0].keys()) if isinstance(sample, list) and sample else [],
-            "sample_3rows": sample,
-            "sample_6770": row_6770,
-        }
-    except Exception as e:
-        results["tpex"] = {"error": str(e)}
-
-    return results
-
-
-@router.get("/debug/tpex-1565")
-async def debug_tpex_1565():
-    """
-    逐日追蹤 1565 的 TPEX 取得過程，找出 null 的原因。
-    """
-    import httpx as _hx
-    from datetime import datetime, timedelta
-
-    results = []
-    d = datetime.now()
-
-    async with _hx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        attempts = 0
-        while len(results) < 3 and attempts < 10:
-            d -= timedelta(days=1)
-            attempts += 1
-            if d.weekday() >= 5:
-                continue
-
-            date_str = f"{d.year}/{d.month:02d}/{d.day:02d}"
-            url = (
-                "https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
-                f"3itrade_hedge_result.php?l=zh-tw&se=AL&t=D&d={date_str}"
-            )
-            try:
-                resp = await client.get(url, headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; twstock-debug/1.0)",
-                    "Accept": "application/json, */*",
-                    "Referer": "https://www.tpex.org.tw/",
-                })
-                j = resp.json()
-                tables = j.get("tables", [])
-                t0 = tables[0] if tables else {}
-                fields = t0.get("fields", [])
-                data   = t0.get("data",   [])
-
-                row_1565 = next(
-                    (r for r in data if r and str(r[0]).strip() == "1565"),
-                    None
-                )
-
-                results.append({
-                    "date":         date_str,
-                    "status":       resp.status_code,
-                    "table_count":  len(tables),
-                    "fields_count": len(fields),
-                    "data_count":   len(data),
-                    "row_1565_found": row_1565 is not None,
-                    # 若找到，回傳關鍵索引的值（不回傳整行）
-                    "col4_foreign":  row_1565[4]  if row_1565 and len(row_1565) > 4  else "N/A",
-                    "col13_invest":  row_1565[13] if row_1565 and len(row_1565) > 13 else "N/A",
-                    "col22_dealer":  row_1565[22] if row_1565 and len(row_1565) > 22 else "N/A",
-                    "col23_total":   row_1565[23] if row_1565 and len(row_1565) > 23 else "N/A",
-                })
-            except Exception as e:
-                results.append({"date": date_str, "error": str(e)})
-
-    return {"results": results}
+        return {"ok": False, "error_type": type(e).__name__, "error": str(e)[:120]}

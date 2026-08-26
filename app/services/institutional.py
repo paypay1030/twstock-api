@@ -44,13 +44,52 @@ from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
-# ── 快取：法人資料更新頻率低，TTL 20 分鐘，最多 200 支股票 ──
-_inst_cache: TTLCache = TTLCache(maxsize=200, ttl=1200)
+# ── 快取：法人資料每日更新一次，TTL 6 小時，最多 200 支股票 ──
+# Render Free 重啟後快取清空，重啟後第一次請求重新取得即可
+_inst_cache: TTLCache = TTLCache(maxsize=200, ttl=21600)
+# TTL 6 小時：三大法人資料盤後約 4-5 點發布，6 小時快取確保盤後不重打 API
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; twstock-api/1.0)",
     "Accept":     "application/json, */*",
 }
+
+_MAX_RETRY = 1  # 暫時性失敗最多 retry 1 次，避免無限重試
+
+
+async def _get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    label: str,
+) -> Optional[httpx.Response]:
+    """
+    發送 GET 請求，暫時性失敗時 retry 1 次。
+    永久性失敗（404、非 2xx）不 retry。
+    """
+    for attempt in range(_MAX_RETRY + 1):
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp
+            # 非 200 且非 503/429（暫時性），不 retry
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                logger.warning(f"[{label}] HTTP {resp.status_code}, no retry")
+                return None
+            if attempt < _MAX_RETRY:
+                logger.warning(f"[{label}] HTTP {resp.status_code}, retry {attempt+1}")
+                await asyncio.sleep(1.0)
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            if attempt < _MAX_RETRY:
+                logger.warning(f"[{label}] {type(e).__name__}, retry {attempt+1}")
+                await asyncio.sleep(1.0)
+            else:
+                logger.error(f"[{label}] {type(e).__name__} after {_MAX_RETRY+1} attempts: {e}")
+                return None
+        except Exception as e:
+            logger.error(f"[{label}] unexpected: {e}")
+            return None
+    return None
 
 
 # ════════════════════════════════════════════════════════════
@@ -158,11 +197,18 @@ async def _fetch_twse_day(client: httpx.AsyncClient, code: str, date: str) -> Op
     回傳 None 代表該日無資料（假日或盤後尚未公布）。
     """
     url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={date}&selectType=ALL"
+    label = f"twse/{code}/{date}"
     try:
-        resp = await client.get(url, headers={**HEADERS, "Referer": "https://www.twse.com.tw/"})
+        resp = await _get_with_retry(
+            client, url,
+            headers={**HEADERS, "Referer": "https://www.twse.com.tw/"},
+            label=label,
+        )
+        if resp is None:
+            return None
         j = resp.json()
     except Exception as e:
-        logger.warning(f"[twse] {code} {date} fetch error: {e}")
+        logger.warning(f"[twse] {code} {date} parse error: {e}")
         return None
 
     if j.get("stat") != "OK":
@@ -251,6 +297,64 @@ async def _fetch_twse(code: str) -> list[dict]:
 # TPEX 上櫃
 # ════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════
+# TPEX 欄位結構驗證
+# ════════════════════════════════════════════════════════════
+
+# 由 Render 實測（2026-08-21）確認的欄位結構
+_TPEX_EXPECTED_FIELDS = 24
+
+# 關鍵索引與其「應包含的關鍵字」——用於改版偵測
+# 若 TPEX 改版後索引位移，這裡的驗證會觸發 WARNING，阻止錯誤計算
+_TPEX_KEY_INDICES: dict[int, str] = {
+    4:  "買賣超",   # 外資及陸資買賣超
+    13: "買賣超",   # 投信買賣超
+    22: "買賣超",   # 自營商合計買賣超
+    23: "合計",     # 三大法人買賣超股數合計
+}
+
+
+def _validate_tpex_fields(
+    fields:   list[str],
+    date_str: str,
+    code:     str,
+) -> tuple[bool, str]:
+    """
+    驗證 TPEX 欄位結構是否符合預期。
+
+    回傳 (ok: bool, reason: str)。
+    ok=False 代表欄位結構異常，呼叫方應跳過該日資料並記錄 reason。
+
+    設計原則：
+    - 正確情況下不改變任何行為（直接回傳 True）
+    - 異常時提供清楚的 reason，方便日後 TPEX 改版後排查
+    - 不猜測、不估算、不回傳部分資料
+    """
+    # 1. fields 必須存在且非空
+    if not fields:
+        return False, f"[tpex] {code} {date_str} fields 空陣列"
+
+    # 2. 欄位數量必須符合預期
+    n = len(fields)
+    if n != _TPEX_EXPECTED_FIELDS:
+        return False, (
+            f"[tpex] {code} {date_str} 欄位數量異常：期望 {_TPEX_EXPECTED_FIELDS}，"
+            f"實際 {n}。可能 TPEX 已改版，請重新確認索引對應。"
+        )
+
+    # 3. 關鍵索引的欄位名稱必須包含預期關鍵字
+    for idx, keyword in _TPEX_KEY_INDICES.items():
+        field_name = fields[idx] if idx < n else ""
+        if keyword not in field_name:
+            return False, (
+                f"[tpex] {code} {date_str} 索引 [{idx}] 欄位名稱異常："
+                f"期望含「{keyword}」，實際為「{field_name}」。"
+                f"可能 TPEX 已改版，請重新確認索引對應。"
+            )
+
+    return True, ""
+
+
 async def _fetch_tpex_day(client: httpx.AsyncClient, code: str, date_str: str) -> Optional[dict]:
     """
     取得 TPEX 單日指定股票的三大法人資料。
@@ -289,11 +393,18 @@ async def _fetch_tpex_day(client: httpx.AsyncClient, code: str, date_str: str) -
         "https://www.tpex.org.tw/web/stock/3insti/daily_trade/"
         f"3itrade_hedge_result.php?l=zh-tw&se=AL&t=D&d={date_str}"
     )
+    label = f"tpex/{code}/{date_str}"
     try:
-        resp = await client.get(url, headers={**HEADERS, "Referer": "https://www.tpex.org.tw/"})
+        resp = await _get_with_retry(
+            client, url,
+            headers={**HEADERS, "Referer": "https://www.tpex.org.tw/"},
+            label=label,
+        )
+        if resp is None:
+            return None
         j = resp.json()
     except Exception as e:
-        logger.warning(f"[tpex] {code} {date_str} fetch error: {e}")
+        logger.warning(f"[tpex] {code} {date_str} parse error: {e}")
         return None
 
     tables = j.get("tables", [])
@@ -308,12 +419,11 @@ async def _fetch_tpex_day(client: httpx.AsyncClient, code: str, date_str: str) -
     fields = target_table.get("fields", [])
     data   = target_table["data"]
 
-    # 確認欄位數量（24 欄），避免 TPEX 改版時默默算錯
-    if len(fields) != 24:
-        logger.warning(f"[tpex] {code} {date_str} unexpected fields count={len(fields)}")
-        # 欄位數不符時仍嘗試解析，但記錄警告供排查
-        if len(fields) < 24:
-            return None
+    # 欄位結構驗證（改版偵測）
+    ok, reason = _validate_tpex_fields(fields, date_str, code)
+    if not ok:
+        logger.warning(reason)
+        return None  # 結構異常時安全降級，不猜測索引，不回傳部分資料
 
     # 找目標股票（第一欄為代號）
     row = next((r for r in data if r and str(r[0]).strip() == code), None)
@@ -435,6 +545,7 @@ async def calculate_institutional(code: str) -> dict:
             logger.warning(f"[institutional] no data for {code}")
             result = _empty_response("no_data")
             result["dataSource"] = data_source
+            # 不寫入快取：無資料可能是暫時性（API 未更新），下次請求應重試
             return result
 
         # 格式化成 API response 結構
