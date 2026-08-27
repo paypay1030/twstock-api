@@ -42,7 +42,8 @@ def _fetch_taiex() -> Optional[dict]:
         prev    = hist.iloc[-2] if len(hist) >= 2 else None
 
         close   = float(latest["Close"])
-        volume  = float(latest["Volume"])          # 成交量（股，台灣通常報張）
+        # Volume 單位：yfinance ^TWII Volume 數字含義模糊（實測 2026-08-27 發現換算結果不合理）
+        # 不做換算，不顯示成交金額，市場判斷只依賴漲跌幅
 
         if prev is not None:
             prev_close = float(prev["Close"])
@@ -54,19 +55,11 @@ def _fetch_taiex() -> Optional[dict]:
 
         trade_date = hist.index[-1].strftime("%Y-%m-%d")
 
-        # yfinance 對 ^TWII 的 Volume 通常是成交張數（台灣）
-        # 換算成交金額（億）= 張數 × 均價 × 1000 ÷ 1e8（估算，非精確）
-        avg_price     = close
-        volume_lots   = volume  # 張
-        volume_billion = round(volume_lots * avg_price * 1000 / 1e8, 1)
-
         return {
-            "close":          close,
-            "change":         change,
-            "change_pct":     change_pct,
-            "volume_lots":    volume_lots,
-            "volume_billion": volume_billion,
-            "trade_date":     trade_date,
+            "close":      close,
+            "change":     change,
+            "change_pct": change_pct,
+            "trade_date": trade_date,
         }
 
     except Exception as e:
@@ -78,7 +71,7 @@ def _fetch_taiex() -> Optional[dict]:
 # 市場判斷邏輯
 # ════════════════════════════════════════════════════════════
 
-def _classify_market(change_pct: float, volume_billion: float) -> dict:
+def _classify_market(change_pct: float) -> dict:
     """
     依漲跌幅與成交金額分類市場狀態，產生建議內容。
     分類邏輯：
@@ -88,15 +81,11 @@ def _classify_market(change_pct: float, volume_billion: float) -> dict:
       偏空：跌幅 0.3%~1.5%
       強空：跌幅 > 1.5% 或量能放大下跌
     """
-    # 量能判斷（粗略：近期均量約 3000 億，低於 2000 算量縮）
-    vol_ok = volume_billion >= 2000
-    vol_high = volume_billion >= 3500
-
-    if change_pct > 1.5 and vol_ok:
+    if change_pct > 1.5:
         mood = "strong_bull"
     elif change_pct > 0.3:
         mood = "bull"
-    elif change_pct < -1.5 or (change_pct < -0.8 and vol_high):
+    elif change_pct < -1.5:
         mood = "strong_bear"
     elif change_pct < -0.3:
         mood = "bear"
@@ -200,15 +189,12 @@ def generate_today_note() -> dict:
         _note_cache.pop(cache_key, None)
         return result
 
-    mood = _classify_market(taiex["change_pct"], taiex["volume_billion"])
+    mood = _classify_market(taiex["change_pct"])
 
     # 組合數字摘要（放在 body 前面）
-    chg_sign = "+" if taiex["change"] >= 0 else ""
-    vol_str  = f"{taiex['volume_billion']:.0f} 億" if taiex["volume_billion"] > 0 else "未知"
     body_prefix = (
         f"加權指數 {taiex['close']:,.0f} 點，"
-        f"漲跌 {chg_sign}{taiex['change']:+.0f}（{chg_sign}{taiex['change_pct']:.2f}%），"
-        f"成交金額約 {vol_str}。\n\n"
+        f"漲跌 {taiex['change']:+.0f}（{taiex['change_pct']:+.2f}%）。\n\n"
     )
 
     result = {
@@ -224,12 +210,11 @@ def generate_today_note() -> dict:
         "source":      "market_data",
         # 額外給前端參考，不影響 TodayNoteData contract
         "marketData": {
-            "taiex":        taiex["close"],
-            "change":       taiex["change"],
-            "changePct":    taiex["change_pct"],
-            "volumeBillion":taiex["volume_billion"],
-            "tradeDate":    taiex["trade_date"],
-            "mood":         mood["label"],
+            "taiex":     taiex["close"],
+            "change":    taiex["change"],
+            "changePct": taiex["change_pct"],
+            "tradeDate": taiex["trade_date"],
+            "mood":      mood["label"],
         },
     }
 
