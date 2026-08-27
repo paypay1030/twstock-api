@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.core.config import get_settings
 from app.routers import stock, analysis
+from app.routers import today_note
 
 settings = get_settings()
 
@@ -57,6 +58,7 @@ app.add_middleware(
 # 掛載 Router
 app.include_router(stock.router)
 app.include_router(analysis.router)
+app.include_router(today_note.router)
 
 
 @app.get("/")
